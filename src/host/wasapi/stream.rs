@@ -1,4 +1,4 @@
-use super::windows_err_to_cpal_err;
+use super::{windows_err_to_cpal_err, ShareMode};
 use crate::traits::StreamTrait;
 use crate::{
     BackendSpecificError, Data, InputCallbackInfo, OutputCallbackInfo, PauseStreamError,
@@ -8,6 +8,7 @@ use std::mem;
 use std::ptr;
 use std::sync::mpsc::{channel, Receiver, SendError, Sender};
 use std::thread::{self, JoinHandle};
+use thread_priority::{ThreadBuilder, ThreadPriority};
 use windows::Win32::Foundation;
 use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::Media::Audio;
@@ -74,6 +75,9 @@ pub struct StreamInner {
     pub bytes_per_frame: u16,
     // The configuration with which the stream was created.
     pub config: crate::StreamConfig,
+
+    pub share_mode: ShareMode,
+
     // The sample format with which the stream was created.
     pub sample_format: SampleFormat,
 }
@@ -133,9 +137,10 @@ impl Stream {
             commands: rx,
         };
 
-        let thread = thread::Builder::new()
+        let thread = ThreadBuilder::default()
             .name("cpal_wasapi_out".to_owned())
-            .spawn(move || run_output(run_context, &mut data_callback, &mut error_callback))
+            .priority(ThreadPriority::Crossplatform(99.try_into().unwrap()))
+            .spawn(move |_| run_output(run_context, &mut data_callback, &mut error_callback))
             .unwrap();
 
         Stream {
@@ -266,6 +271,15 @@ fn get_available_frames(stream: &StreamInner) -> Result<u32, StreamError> {
     }
 }
 
+fn get_buffer_size(stream: &StreamInner) -> Result<u32, StreamError> {
+    unsafe {
+        stream
+            .audio_client
+            .GetBufferSize()
+            .map_err(windows_err_to_cpal_err::<StreamError>)
+    }
+}
+
 fn run_input(
     mut run_ctxt: RunContext,
     data_callback: &mut dyn FnMut(&Data, &InputCallbackInfo),
@@ -298,25 +312,34 @@ fn run_output(
     data_callback: &mut dyn FnMut(&mut Data, &OutputCallbackInfo),
     error_callback: &mut dyn FnMut(StreamError),
 ) {
+    let mut first = true;
+
     loop {
+        // If exclusive mode make sure we fill first buffer before start is called
+        if !first || run_ctxt.stream.share_mode != ShareMode::Exclusive {
         match process_commands_and_await_signal(&mut run_ctxt, error_callback) {
             Some(ControlFlow::Break) => break,
             Some(ControlFlow::Continue) => continue,
             None => (),
         }
-        let render_client = match run_ctxt.stream.client_flow {
-            AudioClientFlow::Render { ref render_client } => render_client.clone(),
-            _ => unreachable!(),
-        };
-        match process_output(
+        }
+
+        match &run_ctxt.stream.client_flow {
+            AudioClientFlow::Render { render_client } => {
+                if let ControlFlow::Break = process_output(
             &run_ctxt.stream,
             render_client,
             data_callback,
             error_callback,
         ) {
-            ControlFlow::Break => break,
-            ControlFlow::Continue => continue,
+                    break;
+                }
+            }
+
+            _ => unreachable!(),
         }
+
+        first = false;
     }
 }
 
@@ -429,12 +452,17 @@ fn process_input(
 // The loop for writing output data.
 fn process_output(
     stream: &StreamInner,
-    render_client: Audio::IAudioRenderClient,
+    render_client: &Audio::IAudioRenderClient,
     data_callback: &mut dyn FnMut(&mut Data, &OutputCallbackInfo),
     error_callback: &mut dyn FnMut(StreamError),
 ) -> ControlFlow {
+    let frame_count = match stream.share_mode {
+        ShareMode::Shared => get_available_frames(stream),
+        ShareMode::Exclusive => get_buffer_size(stream),
+    };
+
     // The number of frames available for writing.
-    let frames_available = match get_available_frames(stream) {
+    let frames_available = match frame_count {
         Ok(0) => return ControlFlow::Continue, // TODO: Can this happen?
         Ok(n) => n,
         Err(err) => {

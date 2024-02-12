@@ -16,13 +16,13 @@ use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use super::com;
+use super::{com, ShareMode};
 use super::{windows_err_to_cpal_err, windows_err_to_cpal_err_message};
 use windows::core::ComInterface;
 use windows::core::GUID;
 use windows::Win32::Devices::Properties;
 use windows::Win32::Foundation;
-use windows::Win32::Media::Audio::IAudioRenderClient;
+use windows::Win32::Media::Audio::{IAudioRenderClient, AUDCLNT_SHAREMODE};
 use windows::Win32::Media::{Audio, KernelStreaming, Multimedia};
 use windows::Win32::System::Com;
 use windows::Win32::System::Com::{StructuredStorage, STGM_READ};
@@ -45,6 +45,7 @@ unsafe impl Sync for IAudioClientWrapper {}
 #[derive(Clone)]
 pub struct Device {
     device: Audio::IMMDevice,
+    share_mode: ShareMode,
     /// We cache an uninitialized `IAudioClient` so that we can call functions from it without
     /// having to create/destroy audio clients all the time.
     future_audio_client: Arc<Mutex<Option<IAudioClientWrapper>>>, // TODO: add NonZero around the ptr
@@ -124,6 +125,7 @@ struct Endpoint {
     endpoint: Audio::IMMEndpoint,
 }
 
+#[derive(Clone)]
 enum WaveFormat {
     Ex(Audio::WAVEFORMATEX),
     Extensible(Audio::WAVEFORMATEXTENSIBLE),
@@ -154,6 +156,13 @@ impl WaveFormat {
                 }
                 _ => None,
             }
+        }
+    }
+    
+    pub fn channel_mask(&self) -> Option<u32> {
+        match self {
+            WaveFormat::Ex(_) => None,
+            WaveFormat::Extensible(e) => Some(e.dwChannelMask),
         }
     }
 
@@ -197,12 +206,13 @@ unsafe fn data_flow_from_immendpoint(endpoint: &Audio::IMMEndpoint) -> Audio::ED
 // Given the audio client and format, returns whether or not the format is supported.
 pub unsafe fn is_format_supported(
     client: &Audio::IAudioClient,
+    share_mode: ShareMode,
     waveformatex_ptr: *const Audio::WAVEFORMATEX,
 ) -> Result<bool, SupportedStreamConfigsError> {
     // Check if the given format is supported.
     let is_supported = |waveformatex_ptr, closest_waveformatex_ptr| {
         let result = client.IsFormatSupported(
-            Audio::AUDCLNT_SHAREMODE_SHARED,
+            to_winapi_share_mode(share_mode),
             waveformatex_ptr,
             Some(closest_waveformatex_ptr),
         );
@@ -253,12 +263,18 @@ unsafe fn format_from_waveformatex_ptr(
         (*waveformatex_ptr).wFormatTag as u32,
     ) {
         (16, Audio::WAVE_FORMAT_PCM) => SampleFormat::I16,
+        (24, Audio::WAVE_FORMAT_PCM) => SampleFormat::I24,
+        (32, Audio::WAVE_FORMAT_PCM) => SampleFormat::I32,
         (32, Multimedia::WAVE_FORMAT_IEEE_FLOAT) => SampleFormat::F32,
         (n_bits, KernelStreaming::WAVE_FORMAT_EXTENSIBLE) => {
             let waveformatextensible_ptr = waveformatex_ptr as *const Audio::WAVEFORMATEXTENSIBLE;
             let sub = (*waveformatextensible_ptr).SubFormat;
             if n_bits == 16 && cmp_guid(&sub, &KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM) {
                 SampleFormat::I16
+            } else if n_bits == 24 && cmp_guid(&sub, &KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM) {
+                SampleFormat::I24
+            } else if n_bits == 32 && cmp_guid(&sub, &KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM) {
+                SampleFormat::I32
             } else if n_bits == 32 && cmp_guid(&sub, &Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) {
                 SampleFormat::F32
             } else {
@@ -318,6 +334,24 @@ unsafe fn format_from_waveformatex_ptr(
 unsafe impl Send for Device {}
 unsafe impl Sync for Device {}
 
+fn to_winapi_share_mode(share_mode: ShareMode) -> AUDCLNT_SHAREMODE {
+    match share_mode {
+        ShareMode::Shared => Audio::AUDCLNT_SHAREMODE_SHARED,
+        ShareMode::Exclusive => Audio::AUDCLNT_SHAREMODE_EXCLUSIVE,
+    }
+}
+
+fn get_default_format(
+    client: &Audio::IAudioClient,
+) -> Result<WaveFormat, SupportedStreamConfigsError> {
+    unsafe {
+        client
+            .GetMixFormat()
+            .map(|f| WaveFormat::copy_from_waveformatex_ptr(f).unwrap())
+            .map_err(windows_err_to_cpal_err::<SupportedStreamConfigsError>)
+    }
+}
+
 impl Device {
     pub fn name(&self) -> Result<String, DeviceNameError> {
         unsafe {
@@ -372,10 +406,11 @@ impl Device {
     }
 
     #[inline]
-    fn from_immdevice(device: Audio::IMMDevice) -> Self {
+    fn from_immdevice(device: Audio::IMMDevice, share_mode: ShareMode) -> Self {
         Device {
             device,
             future_audio_client: Arc::new(Mutex::new(None)),
+            share_mode,
         }
     }
 
@@ -416,7 +451,10 @@ impl Device {
     // number of channels seems to be supported. Any, more or less returns an invalid
     // parameter error. Thus, we just assume that the default number of channels is the only
     // number supported.
-    fn supported_formats(&self) -> Result<SupportedInputConfigs, SupportedStreamConfigsError> {
+    fn supported_formats(
+        &self,
+        share_mode: ShareMode,
+    ) -> Result<SupportedInputConfigs, SupportedStreamConfigsError> {
         // initializing COM because we call `CoTaskMemFree` to release the format.
         com::com_initialized();
 
@@ -515,7 +553,7 @@ impl Device {
         &self,
     ) -> Result<SupportedInputConfigs, SupportedStreamConfigsError> {
         if self.data_flow() == Audio::eCapture {
-            self.supported_formats()
+            self.supported_formats(self.share_mode)
         // If it's an output device, assume no input formats.
         } else {
             Ok(vec![].into_iter())
@@ -526,7 +564,7 @@ impl Device {
         &self,
     ) -> Result<SupportedOutputConfigs, SupportedStreamConfigsError> {
         if self.data_flow() == Audio::eRender {
-            self.supported_formats()
+            self.supported_formats(self.share_mode)
         // If it's an input device, assume no output formats.
         } else {
             Ok(vec![].into_iter())
@@ -560,7 +598,46 @@ impl Device {
                 .map(WaveFormatExPtr)
                 .map_err(windows_err_to_cpal_err::<DefaultStreamConfigError>)?;
 
-            format_from_waveformatex_ptr(format_ptr.0, client)
+            let mut default_format = WaveFormat::copy_from_waveformatex_ptr(format_ptr.0).unwrap();
+
+            // For exclusive mode the default mix sample format is probably not correct,
+            // so pick the supported sample format with the highest precision
+            if self.share_mode == ShareMode::Exclusive {
+                for sample_format in [
+                    SampleFormat::I64,
+                    SampleFormat::F64,
+                    SampleFormat::I32,
+                    SampleFormat::F32,
+                    SampleFormat::I24,
+                    SampleFormat::I16,
+                    SampleFormat::U8,
+                ] {
+                    if let Some(format) = config_to_waveformatextensible(
+                        &StreamConfig {
+                            channels: default_format.nChannels,
+                            sample_rate: SampleRate(default_format.nSamplesPerSec),
+                            buffer_size: BufferSize::Default,
+                        },
+                        sample_format,
+                        default_format.channel_mask(),
+                    ) {
+                        if is_format_supported(
+                            client,
+                            self.share_mode,
+                            &format.Format as *const Audio::WAVEFORMATEX,
+                        )
+                        .map_err(|_| DefaultStreamConfigError::DeviceNotAvailable)?
+                        {
+                            default_format =
+                                WaveFormat::copy_from_waveformatex_ptr(&format.Format as *const _)
+                                    .unwrap();
+                            break;
+                        }
+                    }
+                }
+            }
+
+            format_from_waveformatex_ptr(default_format.deref() as *const _, client)
                 .ok_or(DefaultStreamConfigError::StreamTypeNotSupported)
         }
     }
@@ -611,7 +688,8 @@ impl Device {
             };
 
             let buffer_duration =
-                buffer_size_to_duration(&config.buffer_size, config.sample_rate.0);
+                buffer_size_to_duration(&audio_client, &config.buffer_size, config.sample_rate.0)
+                    .map_err(|_| BuildStreamError::DeviceNotAvailable)?;
 
             let mut stream_flags = Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
 
@@ -621,12 +699,23 @@ impl Device {
 
             // Computing the format and initializing the device.
             let waveformatex = {
-                let format_attempt = config_to_waveformatextensible(config, sample_format)
+                let format_attempt = config_to_waveformatextensible(
+                    config,
+                    sample_format,
+                    get_default_format(&audio_client)
+                        .map_err(|_| BuildStreamError::StreamConfigNotSupported)?
+                        .channel_mask(),
+                )
                     .ok_or(BuildStreamError::StreamConfigNotSupported)?;
-                let share_mode = Audio::AUDCLNT_SHAREMODE_SHARED;
+
+                let share_mode = to_winapi_share_mode(self.share_mode);
 
                 // Ensure the format is supported.
-                match super::device::is_format_supported(&audio_client, &format_attempt.Format) {
+                match super::device::is_format_supported(
+                    &audio_client,
+                    self.share_mode,
+                    &format_attempt.Format,
+                ) {
                     Ok(false) => return Err(BuildStreamError::StreamConfigNotSupported),
                     Err(_) => return Err(BuildStreamError::DeviceNotAvailable),
                     _ => (),
@@ -706,6 +795,7 @@ impl Device {
                 bytes_per_frame: waveformatex.nBlockAlign,
                 config: config.clone(),
                 sample_format,
+                share_mode: self.share_mode,
             })
         }
     }
@@ -726,20 +816,38 @@ impl Device {
                 .map_err(windows_err_to_cpal_err::<BuildStreamError>)?;
 
             let buffer_duration =
-                buffer_size_to_duration(&config.buffer_size, config.sample_rate.0);
+                buffer_size_to_duration(&audio_client, &config.buffer_size, config.sample_rate.0)
+                    .map_err(|_| BuildStreamError::DeviceNotAvailable)?;
 
             // Computing the format and initializing the device.
             let waveformatex = {
-                let format_attempt = config_to_waveformatextensible(config, sample_format)
+                let format_attempt = config_to_waveformatextensible(
+                    config,
+                    sample_format,
+                    get_default_format(&audio_client)
+                        .map_err(|_| BuildStreamError::StreamConfigNotSupported)?
+                        .channel_mask(),
+                )
                     .ok_or(BuildStreamError::StreamConfigNotSupported)?;
-                let share_mode = Audio::AUDCLNT_SHAREMODE_SHARED;
+
+                let share_mode = to_winapi_share_mode(self.share_mode);
 
                 // Ensure the format is supported.
-                match super::device::is_format_supported(&audio_client, &format_attempt.Format) {
+                match super::device::is_format_supported(
+                    &audio_client,
+                    self.share_mode,
+                    &format_attempt.Format,
+                ) {
                     Ok(false) => return Err(BuildStreamError::StreamConfigNotSupported),
                     Err(_) => return Err(BuildStreamError::DeviceNotAvailable),
                     _ => (),
                 }
+
+                let periodicity = if self.share_mode == ShareMode::Shared {
+                    0
+                } else {
+                    buffer_duration
+                };
 
                 // Finally, initializing the audio client
                 audio_client
@@ -747,7 +855,7 @@ impl Device {
                         share_mode,
                         Audio::AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                         buffer_duration,
-                        0,
+                        periodicity,
                         &format_attempt.Format,
                         None,
                     )
@@ -809,6 +917,7 @@ impl Device {
                 bytes_per_frame: waveformatex.nBlockAlign,
                 config: config.clone(),
                 sample_format,
+                share_mode: self.share_mode,
             })
         }
     }
@@ -912,12 +1021,13 @@ unsafe impl Sync for Enumerator {}
 /// WASAPI implementation for `Devices`.
 pub struct Devices {
     collection: Audio::IMMDeviceCollection,
+    share_mode: ShareMode,
     total_count: u32,
     next_item: u32,
 }
 
 impl Devices {
-    pub fn new() -> Result<Self, DevicesError> {
+    pub fn new(share_mode: ShareMode) -> Result<Self, DevicesError> {
         unsafe {
             // can fail because of wrong parameters (should never happen) or out of memory
             let collection = get_enumerator()
@@ -929,6 +1039,7 @@ impl Devices {
 
             Ok(Devices {
                 collection,
+                share_mode,
                 total_count: count,
                 next_item: 0,
             })
@@ -950,7 +1061,7 @@ impl Iterator for Devices {
         unsafe {
             let device = self.collection.Item(self.next_item).unwrap();
             self.next_item += 1;
-            Some(Device::from_immdevice(device))
+            Some(Device::from_immdevice(device, self.share_mode))
         }
     }
 
@@ -962,23 +1073,23 @@ impl Iterator for Devices {
     }
 }
 
-fn default_device(data_flow: Audio::EDataFlow) -> Option<Device> {
+fn default_device(data_flow: Audio::EDataFlow, share_mode: ShareMode) -> Option<Device> {
     unsafe {
         let device = get_enumerator()
             .0
             .GetDefaultAudioEndpoint(data_flow, Audio::eConsole)
             .ok()?;
         // TODO: check specifically for `E_NOTFOUND`, and panic otherwise
-        Some(Device::from_immdevice(device))
+        Some(Device::from_immdevice(device, share_mode))
     }
 }
 
-pub fn default_input_device() -> Option<Device> {
-    default_device(Audio::eCapture)
+pub fn default_input_device(share_mode: ShareMode) -> Option<Device> {
+    default_device(Audio::eCapture, share_mode)
 }
 
-pub fn default_output_device() -> Option<Device> {
-    default_device(Audio::eRender)
+pub fn default_output_device(share_mode: ShareMode) -> Option<Device> {
+    default_device(Audio::eRender, share_mode)
 }
 
 /// Get the audio clock used to produce `StreamInstant`s.
@@ -998,6 +1109,7 @@ unsafe fn get_audio_clock(
 fn config_to_waveformatextensible(
     config: &StreamConfig,
     sample_format: SampleFormat,
+    channel_mask: Option<u32>,
 ) -> Option<Audio::WAVEFORMATEXTENSIBLE> {
     let format_tag = match sample_format {
         SampleFormat::I16 => Audio::WAVE_FORMAT_PCM,
@@ -1029,14 +1141,19 @@ fn config_to_waveformatextensible(
         cbSize: cb_size,
     };
 
-    // CPAL does not care about speaker positions, so pass audio ight through.
-    let channel_mask = KernelStreaming::KSAUDIO_SPEAKER_DIRECTOUT;
+    let channel_mask = channel_mask.unwrap_or(KernelStreaming::KSAUDIO_SPEAKER_DIRECTOUT);
 
     let sub_format = match sample_format {
-        SampleFormat::I16 => KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM,
-        SampleFormat::F32 => Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
+        SampleFormat::U8
+        | SampleFormat::I16
+        | SampleFormat::I24
+        | SampleFormat::I32
+        | SampleFormat::I64 => KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM,
+
+        SampleFormat::F32 | SampleFormat::F64 => Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
         _ => return None,
     };
+
     let waveformatextensible = Audio::WAVEFORMATEXTENSIBLE {
         Format: waveformatex,
         Samples: Audio::WAVEFORMATEXTENSIBLE_0 {
@@ -1049,10 +1166,27 @@ fn config_to_waveformatextensible(
     Some(waveformatextensible)
 }
 
-fn buffer_size_to_duration(buffer_size: &BufferSize, sample_rate: u32) -> i64 {
+fn buffer_size_to_duration(
+    audio_client: &Audio::IAudioClient,
+    buffer_size: &BufferSize,
+    sample_rate: u32,
+) -> Result<i64, StreamError> {
     match buffer_size {
-        BufferSize::Fixed(frames) => *frames as i64 * (1_000_000_000 / 100) / sample_rate as i64,
-        BufferSize::Default => 0,
+        BufferSize::Fixed(frames) => {
+            Ok(*frames as i64 * (1_000_000_000 / 100) / sample_rate as i64)
+        }
+
+        BufferSize::Default => {
+            let mut default_device_period = 0;
+
+            unsafe {
+                audio_client
+                    .GetDevicePeriod(Some(&mut default_device_period as *mut _), None)
+                    .map_err(windows_err_to_cpal_err::<StreamError>)?;
+            }
+
+            Ok(default_device_period)
+        }
     }
 }
 
