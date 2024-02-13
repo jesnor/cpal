@@ -7,9 +7,9 @@ use crate::{
 use std::mem;
 use std::ptr;
 use std::sync::mpsc::{channel, Receiver, SendError, Sender};
-use std::thread::{self, JoinHandle};
-use thread_priority::{ThreadBuilder, ThreadPriority};
+use std::thread::{self, Builder, JoinHandle};
 use windows::Win32::Foundation;
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Foundation::WAIT_OBJECT_0;
 use windows::Win32::Media::Audio;
 use windows::Win32::System::SystemServices;
@@ -137,10 +137,9 @@ impl Stream {
             commands: rx,
         };
 
-        let thread = ThreadBuilder::default()
+        let thread = Builder::new()
             .name("cpal_wasapi_out".to_owned())
-            .priority(ThreadPriority::Crossplatform(99.try_into().unwrap()))
-            .spawn(move |_| run_output(run_context, &mut data_callback, &mut error_callback))
+            .spawn(move || run_output(run_context, &mut data_callback, &mut error_callback))
             .unwrap();
 
         Stream {
@@ -314,24 +313,34 @@ fn run_output(
 ) {
     let mut first = true;
 
+    // Boost thread priority
+    unsafe {
+        let thread_id = Threading::GetCurrentThreadId();
+
+        let _ = Threading::SetThreadPriority(
+            HANDLE(thread_id as isize),
+            Threading::THREAD_PRIORITY_TIME_CRITICAL,
+        );
+    }
+
     loop {
         // If exclusive mode make sure we fill first buffer before start is called
         if !first || run_ctxt.stream.share_mode != ShareMode::Exclusive {
-        match process_commands_and_await_signal(&mut run_ctxt, error_callback) {
-            Some(ControlFlow::Break) => break,
-            Some(ControlFlow::Continue) => continue,
-            None => (),
-        }
+            match process_commands_and_await_signal(&mut run_ctxt, error_callback) {
+                Some(ControlFlow::Break) => break,
+                Some(ControlFlow::Continue) => continue,
+                None => (),
+            }
         }
 
         match &run_ctxt.stream.client_flow {
             AudioClientFlow::Render { render_client } => {
                 if let ControlFlow::Break = process_output(
-            &run_ctxt.stream,
-            render_client,
-            data_callback,
-            error_callback,
-        ) {
+                    &run_ctxt.stream,
+                    render_client,
+                    data_callback,
+                    error_callback,
+                ) {
                     break;
                 }
             }

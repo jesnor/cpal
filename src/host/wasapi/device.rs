@@ -158,7 +158,7 @@ impl WaveFormat {
             }
         }
     }
-    
+
     pub fn channel_mask(&self) -> Option<u32> {
         match self {
             WaveFormat::Ex(_) => None,
@@ -263,7 +263,6 @@ unsafe fn format_from_waveformatex_ptr(
         (*waveformatex_ptr).wFormatTag as u32,
     ) {
         (16, Audio::WAVE_FORMAT_PCM) => SampleFormat::I16,
-        (24, Audio::WAVE_FORMAT_PCM) => SampleFormat::I24,
         (32, Audio::WAVE_FORMAT_PCM) => SampleFormat::I32,
         (32, Multimedia::WAVE_FORMAT_IEEE_FLOAT) => SampleFormat::F32,
         (n_bits, KernelStreaming::WAVE_FORMAT_EXTENSIBLE) => {
@@ -271,8 +270,6 @@ unsafe fn format_from_waveformatex_ptr(
             let sub = (*waveformatextensible_ptr).SubFormat;
             if n_bits == 16 && cmp_guid(&sub, &KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM) {
                 SampleFormat::I16
-            } else if n_bits == 24 && cmp_guid(&sub, &KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM) {
-                SampleFormat::I24
             } else if n_bits == 32 && cmp_guid(&sub, &KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM) {
                 SampleFormat::I32
             } else if n_bits == 32 && cmp_guid(&sub, &Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT) {
@@ -480,7 +477,7 @@ impl Device {
                 .map_err(windows_err_to_cpal_err::<SupportedStreamConfigsError>)?;
 
             // If the default format can't succeed we have no hope of finding other formats.
-            if !is_format_supported(client, default_waveformatex_ptr.0)? {
+            if !is_format_supported(client, share_mode, default_waveformatex_ptr.0)? {
                 let description =
                     "Could not determine support for default `WAVEFORMATEX`".to_string();
                 let err = BackendSpecificError { description };
@@ -507,7 +504,7 @@ impl Device {
                 test_format.nSamplesPerSec = rate;
                 test_format.nAvgBytesPerSec =
                     rate * u32::from((*default_waveformatex_ptr.0).nBlockAlign);
-                if is_format_supported(client, test_format.as_ptr())? {
+                if is_format_supported(client, share_mode, test_format.as_ptr())? {
                     supported_sample_rates.push(rate);
                 }
             }
@@ -608,7 +605,6 @@ impl Device {
                     SampleFormat::F64,
                     SampleFormat::I32,
                     SampleFormat::F32,
-                    SampleFormat::I24,
                     SampleFormat::I16,
                     SampleFormat::U8,
                 ] {
@@ -706,7 +702,7 @@ impl Device {
                         .map_err(|_| BuildStreamError::StreamConfigNotSupported)?
                         .channel_mask(),
                 )
-                    .ok_or(BuildStreamError::StreamConfigNotSupported)?;
+                .ok_or(BuildStreamError::StreamConfigNotSupported)?;
 
                 let share_mode = to_winapi_share_mode(self.share_mode);
 
@@ -828,7 +824,7 @@ impl Device {
                         .map_err(|_| BuildStreamError::StreamConfigNotSupported)?
                         .channel_mask(),
                 )
-                    .ok_or(BuildStreamError::StreamConfigNotSupported)?;
+                .ok_or(BuildStreamError::StreamConfigNotSupported)?;
 
                 let share_mode = to_winapi_share_mode(self.share_mode);
 
@@ -1027,7 +1023,7 @@ pub struct Devices {
 }
 
 impl Devices {
-    pub fn new(share_mode: ShareMode) -> Result<Self, DevicesError> {
+    pub(crate) fn new(share_mode: ShareMode) -> Result<Self, DevicesError> {
         unsafe {
             // can fail because of wrong parameters (should never happen) or out of memory
             let collection = get_enumerator()
@@ -1144,11 +1140,9 @@ fn config_to_waveformatextensible(
     let channel_mask = channel_mask.unwrap_or(KernelStreaming::KSAUDIO_SPEAKER_DIRECTOUT);
 
     let sub_format = match sample_format {
-        SampleFormat::U8
-        | SampleFormat::I16
-        | SampleFormat::I24
-        | SampleFormat::I32
-        | SampleFormat::I64 => KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM,
+        SampleFormat::U8 | SampleFormat::I16 | SampleFormat::I32 | SampleFormat::I64 => {
+            KernelStreaming::KSDATAFORMAT_SUBTYPE_PCM
+        }
 
         SampleFormat::F32 | SampleFormat::F64 => Multimedia::KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
         _ => return None,
